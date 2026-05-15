@@ -1,0 +1,19 @@
+[package]
+name = "poisson-recon"
+version = "0.1.0"
+edition = "2021"
+description = "Screened Poisson Surface Reconstruction in Rust — a production-ready port of Michael Kazhdan's Adaptive Multigrid Solvers (v18.76)"
+license = "BSD-3-Clause"
+repository = "https://github.com/constructor/poisson-recon"
+keywords = ["poisson", "surface-reconstruction", "3d", "mesh", "octree"]
+categories = ["science", "graphics"]
+
+[dependencies]
+rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+num-traits = "0.2"
+mcubes = "0.1"
+lin_alg = "1.4.2"
+
+[dev-dependencies]
+criterion = "0.5"
