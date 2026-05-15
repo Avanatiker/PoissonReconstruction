@@ -2,19 +2,16 @@
 
 use crate::sparse::SparseMatrix;
 
-/// Compute squared L2 norm of a vector
-pub fn square_norm<T: std::ops::Mul<Output = T> + std::ops::Add<Output = T> + Copy + Default>(
-    v: &[T],
-) -> T {
-    v.iter().fold(T::default(), |acc, &x| acc + x * x)
+/// Compute squared L2 norm of a vector (parallel)
+pub fn square_norm(v: &[f64]) -> f64 {
+    use rayon::prelude::*;
+    v.par_iter().map(|&x| x * x).sum()
 }
 
-/// Compute dot product of two vectors
-pub fn dot<T: std::ops::Mul<Output = T> + std::ops::Add<Output = T> + Copy + Default>(
-    a: &[T],
-    b: &[T],
-) -> T {
-    a.iter().zip(b.iter()).fold(T::default(), |acc, (&x, &y)| acc + x * y)
+/// Compute dot product of two vectors (parallel)
+pub fn dot(a: &[f64], b: &[f64]) -> f64 {
+    use rayon::prelude::*;
+    a.par_iter().zip(b.par_iter()).map(|(&x, &y)| x * y).sum()
 }
 
 /// Solve Ax = b using Conjugate Gradient.
@@ -163,25 +160,34 @@ pub fn solve_pcg(
     max_iters
 }
 
-/// Apply Gauss-Seidel relaxation (one forward sweep).
-/// Solves (L + D)*x = b - U*x_old, i.e., x_new = D^{-1} * (b - L*x_new - U*x_old).
-/// This is a basic Gauss-Seidel for symmetric positive-definite matrices.
+/// Apply Gauss-Seidel relaxation (sequential — correct for all stencils).
 pub fn gauss_seidel_sweep(a: &SparseMatrix<f64>, b: &[f64], x: &mut [f64]) {
     let n = a.num_rows();
     for i in 0..n {
         let mut diag = 0.0f64;
         let mut sum = 0.0f64;
         for entry in a.row(i) {
-            if entry.col == i {
-                diag = entry.value;
-            } else {
-                sum += entry.value * x[entry.col];
-            }
+            if entry.col == i { diag = entry.value; }
+            else { sum += entry.value * x[entry.col]; }
         }
-        if diag != 0.0 {
-            x[i] = (b[i] - sum) / diag;
-        }
+        if diag != 0.0 { x[i] = (b[i] - sum) / diag; }
     }
+}
+
+/// Jacobi relaxation (parallel — all updates computed from previous x).
+pub fn jacobi_sweep(a: &SparseMatrix<f64>, b: &[f64], x: &mut [f64], temp: &mut [f64]) {
+    use rayon::prelude::*;
+    let n = a.num_rows();
+    temp.par_iter_mut().enumerate().for_each(|(i, t)| {
+        let mut diag = 0.0f64;
+        let mut ax = 0.0f64;
+        for entry in a.row(i) {
+            if entry.col == i { diag = entry.value; }
+            ax += entry.value * x[entry.col];
+        }
+        *t = if diag != 0.0 { x[i] + (b[i] - ax) / diag } else { x[i] };
+    });
+    x.copy_from_slice(temp);
 }
 
 /// Apply symmetric Gauss-Seidel (forward then backward sweep).
@@ -219,35 +225,6 @@ pub fn symmetric_gauss_seidel_sweep(a: &SparseMatrix<f64>, b: &[f64], x: &mut [f
             x[i] = (b[i] - sum) / diag;
         }
     }
-}
-
-/// Over-relaxed Jacobi smoother.
-pub fn jacobi_sweep(
-    a: &SparseMatrix<f64>,
-    b: &[f64],
-    x: &mut [f64],
-    omega: f64,
-    temp: &mut [f64],
-) {
-    let n = a.num_rows();
-
-    for i in 0..n {
-        let mut diag = 0.0f64;
-        let mut ax = 0.0f64;
-        for entry in a.row(i) {
-            if entry.col == i {
-                diag = entry.value;
-            }
-            ax += entry.value * x[entry.col];
-        }
-        if diag != 0.0 {
-            temp[i] = x[i] + omega * (b[i] - ax) / diag;
-        } else {
-            temp[i] = x[i];
-        }
-    }
-
-    x.copy_from_slice(temp);
 }
 
 #[cfg(test)]

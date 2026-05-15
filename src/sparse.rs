@@ -101,19 +101,19 @@ impl<T: Clone + Default + std::ops::AddAssign + std::ops::MulAssign + Copy + std
         self.entries.len()
     }
 
-    /// Matrix-vector multiply: out = self * input
+    /// Matrix-vector multiply: out = self * input (parallel with rayon)
     pub fn multiply_vector(&self, input: &[T], output: &mut [T])
     where
-        T: std::ops::Mul<Output = T>,
+        T: std::ops::Mul<Output = T> + std::ops::Add<Output = T> + Send + Sync + Default + Copy,
     {
-        assert!(output.len() >= self.rows);
-        for i in 0..self.rows {
+        use rayon::prelude::*;
+        output.par_iter_mut().enumerate().for_each(|(i, out)| {
             let mut sum = T::default();
             for entry in self.row(i) {
-                sum += entry.value * input[entry.col];
+                sum = sum + entry.value * input[entry.col];
             }
-            output[i] = sum;
-        }
+            *out = sum;
+        });
     }
 
     /// Transpose times vector: out = self^T * input

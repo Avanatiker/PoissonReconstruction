@@ -155,6 +155,7 @@ impl FEMTree {
             }}}
         }
 
+        // Normalize: divide normal by weight, then negate (Poisson convention)
         for i in 0..n {
             if self.node_weight[i] > 0.0 {
                 let inv = 1.0 / self.node_weight[i];
