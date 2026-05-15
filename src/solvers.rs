@@ -177,7 +177,7 @@ pub fn gauss_seidel_sweep(a: &SparseMatrix<f64>, b: &[f64], x: &mut [f64]) {
 /// Jacobi relaxation (parallel — all updates computed from previous x).
 pub fn jacobi_sweep(a: &SparseMatrix<f64>, b: &[f64], x: &mut [f64], temp: &mut [f64]) {
     use rayon::prelude::*;
-    let n = a.num_rows();
+    let _n = a.num_rows();
     temp.par_iter_mut().enumerate().for_each(|(i, t)| {
         let mut diag = 0.0f64;
         let mut ax = 0.0f64;
