@@ -57,7 +57,8 @@ pub struct FEMTree {
     pub max_depth: u32,
     pub fem_node_count: usize,
     pub octree: octree::Octree,
-    pub offset_to_idx: HashMap<[u32; DIM], usize>,
+    /// Dense grid mapping: grid_to_idx[z*res*res + y*res + x] = FEM index (usize::MAX if none)
+    pub grid_to_idx: Vec<usize>,
     pub idx_to_offset: Vec<[u32; DIM]>,
     pub solution: Vec<f64>,
     pub normal_field: Vec<Vec3>,
@@ -67,8 +68,17 @@ pub struct FEMTree {
 impl FEMTree {
     pub fn new(max_depth: u32) -> Self {
         FEMTree { max_depth, fem_node_count: 0, octree: octree::Octree::new(),
-            offset_to_idx: HashMap::new(), idx_to_offset: Vec::new(),
+            grid_to_idx: Vec::new(), idx_to_offset: Vec::new(),
             solution: Vec::new(), normal_field: Vec::new(), node_weight: Vec::new() }
+    }
+
+    /// Fast O(1) lookup: offset → FEM index.
+    #[inline]
+    fn idx_at(&self, x: usize, y: usize, z: usize) -> Option<usize> {
+        let res = 1usize << self.max_depth;
+        if x >= res || y >= res || z >= res { return None; }
+        let i = self.grid_to_idx.get(z * res * res + y * res + x).copied().unwrap_or(usize::MAX);
+        if i == usize::MAX { None } else { Some(i) }
     }
 
     pub fn initialize(&mut self, _points: &[OrientedPoint], _threshold: f64) {
@@ -88,7 +98,9 @@ impl FEMTree {
     pub fn finalize(&mut self) {
         self.octree.finalize();
         let sorted = self.octree.sorted_nodes.as_ref().expect("not finalized");
-        self.offset_to_idx.clear(); self.idx_to_offset.clear();
+        self.idx_to_offset.clear();
+        let res = 1usize << self.max_depth;
+        self.grid_to_idx = vec![usize::MAX; res * res * res];
         let mut idx = 0;
         for &np in &sorted.tree_nodes {
             unsafe {
@@ -97,8 +109,9 @@ impl FEMTree {
                     n.data_mut().set_flag(octree::flags::SPACE_FLAG, true);
                     n.data_mut().set_flag(octree::flags::FEM_FLAG_1, true);
                     n.data_mut().node_index = idx as octree::NodeIndex;
-                    self.offset_to_idx.insert(n.offset, idx);
-                    self.idx_to_offset.push(n.offset); idx += 1;
+                    let o = n.offset;
+                    self.grid_to_idx[o[2] as usize * res * res + o[1] as usize * res + o[0] as usize] = idx;
+                    self.idx_to_offset.push(o); idx += 1;
                 }
             }
         }
@@ -117,7 +130,7 @@ impl FEMTree {
             for dz_i in 0..=1isize { for dy_i in 0..=1isize { for dx_i in 0..=1isize {
                 let ox = (cx + dx_i) as u32; let oy = (cy + dy_i) as u32; let oz = (cz + dz_i) as u32;
                 if ox >= res as u32 || oy >= res as u32 || oz >= res as u32 { continue; }
-                if let Some(&idx) = self.offset_to_idx.get(&[ox, oy, oz]) {
+                if let Some(idx) = self.idx_at(ox as usize, oy as usize, oz as usize) {
                     let bx = if dx_i == 0 { bx0 } else { bx1 };
                     let by = if dy_i == 0 { by0 } else { by1 };
                     let bz = if dz_i == 0 { bz0 } else { bz1 };
@@ -154,7 +167,7 @@ impl FEMTree {
             for dx in -1isize..=1isize { for dy in -1isize..=1isize { for dz in -1isize..=1isize {
                 let jx = ix as isize + dx; let jy = iy as isize + dy; let jz = iz as isize + dz;
                 if jx < 0 || jx >= res as isize || jy < 0 || jy >= res as isize || jz < 0 || jz >= res as isize { continue; }
-                if let Some(&j) = self.offset_to_idx.get(&[jx as u32, jy as u32, jz as u32]) {
+                if let Some(j) = self.idx_at(jx as usize, jy as usize, jz as usize) {
                     let val = stiffness_entry(h, dx, dy, dz);
                     if val != 0.0 { rows[i].push((j, val)); }
                 }
@@ -172,7 +185,7 @@ impl FEMTree {
                 for dz_i in 0..=1isize { for dy_i in 0..=1isize { for dx_i in 0..=1isize {
                     let ox = (cx + dx_i) as u32; let oy = (cy + dy_i) as u32; let oz = (cz + dz_i) as u32;
                     if ox >= res as u32 || oy >= res as u32 || oz >= res as u32 { continue; }
-                    if let Some(&idx) = self.offset_to_idx.get(&[ox, oy, oz]) {
+                    if let Some(idx) = self.idx_at(ox as usize, oy as usize, oz as usize) {
                         let bx = if dx_i == 0 { bx0 } else { bx1 };
                         let by = if dy_i == 0 { by0 } else { by1 };
                         let bz = if dz_i == 0 { bz0 } else { bz1 };
@@ -222,7 +235,7 @@ impl FEMTree {
             for dx in -1isize..=1isize { for dy in -1isize..=1isize { for dz in -1isize..=1isize {
                 let jx = ix as isize + dx; let jy = iy as isize + dy; let jz = iz as isize + dz;
                 if jx < 0 || jx >= res as isize || jy < 0 || jy >= res as isize || jz < 0 || jz >= res as isize { continue; }
-                if let Some(&j) = self.offset_to_idx.get(&[jx as u32, jy as u32, jz as u32]) {
+                if let Some(j) = self.idx_at(jx as usize, jy as usize, jz as usize) {
                     if j < self.normal_field.len() {
                         let v = self.normal_field[j];
                         sum -= v.x * deriv_mass_1d(dx) * mass_1d(dy) * mass_1d(dz)
@@ -245,7 +258,7 @@ impl FEMTree {
                 for dz_i in 0..=1isize { for dy_i in 0..=1isize { for dx_i in 0..=1isize {
                     let ox = (cx + dx_i) as u32; let oy = (cy + dy_i) as u32; let oz = (cz + dz_i) as u32;
                     if ox >= res as u32 || oy >= res as u32 || oz >= res as u32 { continue; }
-                    if let Some(&idx) = self.offset_to_idx.get(&[ox, oy, oz]) {
+                    if let Some(idx) = self.idx_at(ox as usize, oy as usize, oz as usize) {
                         let bx = if dx_i == 0 { bx0 } else { bx1 };
                         let by = if dy_i == 0 { by0 } else { by1 };
                         let bz = if dz_i == 0 { bz0 } else { bz1 };
@@ -289,7 +302,7 @@ impl FEMTree {
                                 let fx = cx as isize * 2 + dx - 1;
                                 if fx < 0 || fx >= fine_res as isize { continue; }
                                 let w = bw[dx as usize] * bw[dy as usize] * bw[dz as usize];
-                                if let Some(&fi) = self.offset_to_idx.get(&[fx as u32, fy as u32, fz as u32]) {
+                                if let Some(fi) = self.idx_at(fx as usize, fy as usize, fz as usize) {
                                     if fi < fine.len() { fine[fi] += v * w; }
                                 }
                             }
@@ -359,8 +372,8 @@ impl FEMTree {
         (mat, rhs)
     }
 
-    /// Cascadic solver: coarsest level has effective screening `pw / h² = pw * res²`.
-    /// Solve at base_depth, prolongate, then GS+CG at each finer level.
+    /// Cascadic solver: CG at coarsest level, then GS relaxation up to finest.
+    /// Matches C++ approach: cascadic=true, cgDepth=0, iters=8.
     pub fn solve_cascadic(
         &mut self, points: &[OrientedPoint], pw: f64,
         base_depth: u32, gs: usize, cg: usize, eps: f64,
@@ -369,11 +382,14 @@ impl FEMTree {
         let fine_rhs = self.assemble_rhs(points, pw);
 
         if base_depth >= self.max_depth {
-            self.solve(&fine_sys, &fine_rhs, gs, cg, eps);
+            self.solution.resize(self.fem_node_count, 0.0);
+            self.solution.fill(0.0);
+            for _ in 0..gs { solvers::gauss_seidel_sweep(&fine_sys, &fine_rhs, &mut self.solution); }
+            solvers::solve_cg(&fine_sys, &fine_rhs, &mut self.solution, cg, eps);
             return;
         }
 
-        // Build and solve at base_depth
+        // Build and CG-solve at base_depth
         let (bmat, brhs) = self.build_system_at_depth(base_depth, pw);
         let mut csol = vec![0.0; brhs.len()];
         for _ in 0..gs { solvers::gauss_seidel_sweep(&bmat, &brhs, &mut csol); }
@@ -384,9 +400,8 @@ impl FEMTree {
         self.solution.resize(self.fem_node_count, 0.0);
         for i in 0..self.fem_node_count.min(init.len()) { self.solution[i] = init[i]; }
 
-        // GS+CG at fine level with warm start
+        // GS relaxation only at fine level (matches C++ cascadic: no CG at fine level)
         for _ in 0..gs { solvers::gauss_seidel_sweep(&fine_sys, &fine_rhs, &mut self.solution); }
-        solvers::solve_cg(&fine_sys, &fine_rhs, &mut self.solution, cg, eps);
     }
 
     /// Evaluate FEM implicit function at any point in the unit cube.
@@ -406,7 +421,7 @@ impl FEMTree {
         for &(ox, bx) in &[(ox0, bx0), (ox1, bx1)] { if bx == 0.0 { continue; }
             for &(oy, by) in &[(oy0, by0), (oy1, by1)] { if by == 0.0 { continue; }
                 for &(oz, bz) in &[(oz0, bz0), (oz1, bz1)] { if bz == 0.0 { continue; }
-                    if let Some(&idx) = self.offset_to_idx.get(&[ox, oy, oz]) {
+                    if let Some(idx) = self.idx_at(ox as usize, oy as usize, oz as usize) {
                         if idx < self.solution.len() { v += self.solution[idx] * bx * by * bz; }
                     }
                 }
@@ -466,7 +481,7 @@ impl FEMTree {
                     az + t * (cb[2] as i32 - ca[2] as i32) as f64 * w,
                 ];
                 let h = (pos[0] * 1e7) as u64 ^ (pos[1] * 1e7) as u64 ^ (pos[2] * 1e7) as u64;
-                if let Some(&ex) = edge_hash.get(&h) { evi[e] = ex; }
+                if let Some(ex) = edge_hash.get(&h) { evi[e] = *ex; }
                 else { let idx = verts.len(); edge_hash.insert(h, idx); verts.push(pos); evi[e] = idx; }
             }
 

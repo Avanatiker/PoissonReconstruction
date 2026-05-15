@@ -32,59 +32,42 @@ pub fn solve_cg(
     let mut d = vec![0.0f64; n];
     let mut q = vec![0.0f64; n];
 
-    // r = b - A*x
     a.multiply_vector(x, &mut q);
-    for i in 0..n {
-        r[i] = b[i] - q[i];
-    }
+    for i in 0..n { r[i] = b[i] - q[i]; }
     d.copy_from_slice(&r);
 
     let mut delta_new = dot(&r, &r);
     let delta_0 = delta_new;
+    if delta_new == 0.0 { return 0; }
 
-    if delta_new == 0.0 {
-        return 0;
-    }
+    let mut last_check = 0.0f64;
 
     for iter in 0..max_iters {
         a.multiply_vector(&d, &mut q);
-
         let dq = dot(&d, &q);
-        if dq == 0.0 {
-            return iter + 1;
-        }
-
+        if dq == 0.0 { return iter + 1; }
         let alpha = delta_new / dq;
+        for i in 0..n { x[i] += alpha * d[i]; }
 
-        for i in 0..n {
-            x[i] += alpha * d[i];
-        }
-
-        if (iter + 1) % 50 == 0 {
+        if (iter + 1) % 10 == 0 {
             a.multiply_vector(x, &mut q);
-            for i in 0..n {
-                r[i] = b[i] - q[i];
-            }
+            for i in 0..n { r[i] = b[i] - q[i]; }
         } else {
-            for i in 0..n {
-                r[i] -= alpha * q[i];
-            }
+            for i in 0..n { r[i] -= alpha * q[i]; }
         }
 
         let delta_old = delta_new;
         delta_new = dot(&r, &r);
-
         if delta_new <= delta_0 * accuracy * accuracy {
+            
             return iter + 1;
         }
-
         let beta = delta_new / delta_old;
-
-        for i in 0..n {
-            d[i] = r[i] + beta * d[i];
-        }
+        if beta.is_nan() || beta.is_infinite() { break; }
+        for i in 0..n { d[i] = r[i] + beta * d[i]; }
+        if delta_new != last_check { last_check = delta_new; }
     }
-
+    
     max_iters
 }
 
