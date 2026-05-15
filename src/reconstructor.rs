@@ -1,6 +1,6 @@
 use crate::fem_tree::{FEMTree, OrientedPoint};
 use crate::geometry::{unit_cube_transform, BBox, Point3};
-use crate::marching_cubes::{self, Mesh};
+use crate::marching_cubes::Mesh;
 use rayon::prelude::*;
 use std::time::Instant;
 
@@ -64,38 +64,21 @@ pub fn reconstruct(points: &[OrientedPoint], params: &ReconstructParams) -> (Mes
     stats.time_solve = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
-    // Evaluate at FEM resolution (= number of cells, not a finer grid)
-    let res = 1usize << params.depth;  // number of cells per dimension at depth
-    let h = 1.0 / res as f64;
-    let nx = res + 1; // corners = cells + 1
-    let ny = res + 1;
-    let nz = res + 1;
-    let mut grid = vec![0.0f64; nx * ny * nz];
-
-    // Evaluate FEM function at all CORNER positions (grid vertices)
-    // This gives the same topology as evaluating on the FEM cell corners
-    grid.par_chunks_mut(nx * ny).enumerate().for_each(|(iz, slice)| {
-        for iy in 0..ny {
-            for ix in 0..nx {
-                slice[iy * nx + ix] = tree.evaluate(&Point3::new(ix as f64 * h, iy as f64 * h, iz as f64 * h), params.depth);
-            }
-        }
-    });
+    // Evaluate FEM at sample positions to compute iso-value
     let iso = unit_points.par_iter().map(|pt| tree.evaluate(&pt.position, params.depth)).sum::<f64>() / unit_points.len() as f64;
     stats.iso_value = iso;
     stats.time_evaluate = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
-    let unit_mesh = marching_cubes::marching_cubes_regular(&grid, nx, ny, nz, iso, [0.0; 3], [h; 3]);
-    stats.time_marching_cubes = t0.elapsed().as_secs_f64();
-
-    let verts: Vec<[f64; 3]> = unit_mesh.vertices.iter().map(|v| {
+    let (unit_verts, unit_tris) = tree.extract_surface(iso);
+    let verts: Vec<[f64; 3]> = unit_verts.iter().map(|v| {
         let wp = unit_to_model.transform_point(&Point3::new(v[0], v[1], v[2]));
         [wp.x, wp.y, wp.z]
     }).collect();
     stats.mesh_vertices = verts.len();
-    stats.mesh_triangles = unit_mesh.triangles.len();
+    stats.mesh_triangles = unit_tris.len();
+    stats.time_marching_cubes = t0.elapsed().as_secs_f64();
     stats.time_total = t_total.elapsed().as_secs_f64();
 
-    (Mesh { vertices: verts, triangles: unit_mesh.triangles }, stats)
+    (Mesh { vertices: verts, triangles: unit_tris }, stats)
 }
