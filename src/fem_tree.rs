@@ -187,9 +187,9 @@ impl FEMTree {
         // Point interpolation mass (screening) — full 8x8 sparse block per sample
         if pw > 0.0 {
             let wh3 = pw * h.powi(3) / 1.5;
-            // NO global mass — only per-sample screening at surface nodes.
-            // The Laplacian naturally produces χ≈1 inside, χ≈0 outside from
-            // strong surface constraints χ≈0.5.
+            // Add tiny global mass for conditioning (prevents extreme interior drift)
+            let wg = wh3 * 0.005;
+            for i in 0..n { rows[i].push((i, wg)); }
 
             for pt in points {
                 let cx = (pt.position.x / h) as isize; let cy = (pt.position.y / h) as isize; let cz = (pt.position.z / h) as isize;
@@ -265,6 +265,7 @@ impl FEMTree {
         if pw > 0.0 {
             let wh3 = pw * h.powi(3) / 1.5;
             let target = 0.5;
+            // Global matrix mass for conditioning (no global RHS — interior determined by Laplacian)
 
             for pt in points {
                 let cx = (pt.position.x / h) as isize; let cy = (pt.position.y / h) as isize; let cz = (pt.position.z / h) as isize;
@@ -354,7 +355,8 @@ impl FEMTree {
                 if v != 0.0 { rows[i].push((j, v)); }
             }}}
             if effective_pw > 0.0 {
-                rows[i].push((i, effective_pw * h.powi(3) / 1.5));
+                let wh3 = effective_pw * h.powi(3) / 1.5;
+                rows[i].push((i, wh3 * 1.005)); // sample mass + 0.1% global
             }
         }}}
 
@@ -417,8 +419,9 @@ impl FEMTree {
         self.solution.resize(self.fem_node_count, 0.0);
         for i in 0..self.fem_node_count.min(init.len()) { self.solution[i] = init[i]; }
 
-        // GS relaxation only at fine level (matches C++ cascadic: no CG at fine level)
+        // GS relaxation at fine level, then CG to remove global oscillations
         for _ in 0..gs { solvers::gauss_seidel_sweep(&fine_sys, &fine_rhs, &mut self.solution); }
+        solvers::solve_cg(&fine_sys, &fine_rhs, &mut self.solution, cg / 4, eps);
     }
 
     /// Evaluate FEM implicit function at any point in the unit cube.
