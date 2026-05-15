@@ -47,11 +47,7 @@ fn stiffness_entry(h: f64, dx: isize, dy: isize, dz: isize) -> f64 {
    + mass_1d(dx) * mass_1d(dy) * stiff_1d(dz)) * h
 }
 
-/// N_1(t) — the canonical degree-1 B-spline.
-fn bspline_val(s: f64, offset: u32) -> f64 {
-    let d = s - offset as f64;
-    if d < 0.0 || d > 2.0 { 0.0 } else if d <= 1.0 { d } else { 2.0 - d }
-}
+/// B-spline component values N_i(t) for t ∈ [0,1]. Returns D+1 values summing to 1.
 
 pub struct FEMTree {
     pub max_depth: u32,
@@ -118,19 +114,33 @@ impl FEMTree {
         self.fem_node_count = idx; self.solution.resize(idx, 0.0);
     }
 
+    /// Splat oriented normals using degree-1 B-spline (bilinear) weights.
+    /// Each sample distributes to 2^DIM = 8 FEM nodes.
     pub fn splat_normal_field(&mut self, points: &[OrientedPoint]) {
         let n = self.fem_node_count;
         self.normal_field.resize(n, Vec3::ZERO);
         self.node_weight.resize(n, 0.0);
-        let res = 1usize << self.max_depth; let h = 1.0 / res as f64;
+        let res = 1usize << self.max_depth;
+        let h = 1.0 / res as f64;
+
         for pt in points {
-            let cx = (pt.position.x / h) as isize; let cy = (pt.position.y / h) as isize; let cz = (pt.position.z / h) as isize;
-            let tx = pt.position.x / h - cx as f64; let ty = pt.position.y / h - cy as f64; let tz = pt.position.z / h - cz as f64;
-            let bx0 = 1.0 - tx; let bx1 = tx; let by0 = 1.0 - ty; let by1 = ty; let bz0 = 1.0 - tz; let bz1 = tz;
+            let cx = (pt.position.x / h).floor() as isize;
+            let cy = (pt.position.y / h).floor() as isize;
+            let cz = (pt.position.z / h).floor() as isize;
+            let tx = pt.position.x / h - cx as f64;
+            let ty = pt.position.y / h - cy as f64;
+            let tz = pt.position.z / h - cz as f64;
+
+            let bx0 = 1.0 - tx; let bx1 = tx;
+            let by0 = 1.0 - ty; let by1 = ty;
+            let bz0 = 1.0 - tz; let bz1 = tz;
+
             for dz_i in 0..=1isize { for dy_i in 0..=1isize { for dx_i in 0..=1isize {
-                let ox = (cx + dx_i) as u32; let oy = (cy + dy_i) as u32; let oz = (cz + dz_i) as u32;
-                if ox >= res as u32 || oy >= res as u32 || oz >= res as u32 { continue; }
-                if let Some(idx) = self.idx_at(ox as usize, oy as usize, oz as usize) {
+                let ox = (cx + dx_i) as usize;
+                let oy = (cy + dy_i) as usize;
+                let oz = (cz + dz_i) as usize;
+                if ox >= res || oy >= res || oz >= res { continue; }
+                if let Some(idx) = self.idx_at(ox, oy, oz) {
                     let bx = if dx_i == 0 { bx0 } else { bx1 };
                     let by = if dy_i == 0 { by0 } else { by1 };
                     let bz = if dz_i == 0 { bz0 } else { bz1 };
@@ -144,7 +154,7 @@ impl FEMTree {
                 }
             }}}
         }
-        // Normalize: divide normal by weight, then negate (Poisson convention)
+
         for i in 0..n {
             if self.node_weight[i] > 0.0 {
                 let inv = 1.0 / self.node_weight[i];
@@ -176,7 +186,11 @@ impl FEMTree {
 
         // Point interpolation mass (screening) — full 8x8 sparse block per sample
         if pw > 0.0 {
-            let wh3 = pw * h.powi(3);
+            let wh3 = pw * h.powi(3) / 1.5;
+            // NO global mass — only per-sample screening at surface nodes.
+            // The Laplacian naturally produces χ≈1 inside, χ≈0 outside from
+            // strong surface constraints χ≈0.5.
+
             for pt in points {
                 let cx = (pt.position.x / h) as isize; let cy = (pt.position.y / h) as isize; let cz = (pt.position.z / h) as isize;
                 let tx = pt.position.x / h - cx as f64; let ty = pt.position.y / h - cy as f64; let tz = pt.position.z / h - cz as f64;
@@ -238,9 +252,9 @@ impl FEMTree {
                 if let Some(j) = self.idx_at(jx as usize, jy as usize, jz as usize) {
                     if j < self.normal_field.len() {
                         let v = self.normal_field[j];
-                        sum -= v.x * deriv_mass_1d(dx) * mass_1d(dy) * mass_1d(dz)
+                        sum -= h * h * (v.x * deriv_mass_1d(dx) * mass_1d(dy) * mass_1d(dz)
                              + v.y * mass_1d(dx) * deriv_mass_1d(dy) * mass_1d(dz)
-                             + v.z * mass_1d(dx) * mass_1d(dy) * deriv_mass_1d(dz);
+                             + v.z * mass_1d(dx) * mass_1d(dy) * deriv_mass_1d(dz));
                     }
                 }
             }}}
@@ -249,8 +263,9 @@ impl FEMTree {
 
         // Screening RHS
         if pw > 0.0 {
-            let wh3 = pw * h.powi(3);
+            let wh3 = pw * h.powi(3) / 1.5;
             let target = 0.5;
+
             for pt in points {
                 let cx = (pt.position.x / h) as isize; let cy = (pt.position.y / h) as isize; let cz = (pt.position.z / h) as isize;
                 let tx = pt.position.x / h - cx as f64; let ty = pt.position.y / h - cy as f64; let tz = pt.position.z / h - cz as f64;
@@ -338,7 +353,9 @@ impl FEMTree {
                 let v = stiffness_entry(h, dx, dy, dz);
                 if v != 0.0 { rows[i].push((j, v)); }
             }}}
-            if effective_pw > 0.0 { rows[i].push((i, effective_pw * h.powi(3))); }
+            if effective_pw > 0.0 {
+                rows[i].push((i, effective_pw * h.powi(3) / 1.5));
+            }
         }}}
 
         for row in &mut rows {
@@ -366,7 +383,7 @@ impl FEMTree {
             }
         }
         if effective_pw > 0.0 {
-            let wh3 = effective_pw * h.powi(3);
+            let wh3 = effective_pw * h.powi(3) / 1.5;
             for i in 0..n { rhs[i] += wh3 * 0.5; }
         }
         (mat, rhs)
@@ -413,9 +430,9 @@ impl FEMTree {
         let (ox0, ox1) = contributing_offsets(sx, res);
         let (oy0, oy1) = contributing_offsets(sy, res);
         let (oz0, oz1) = contributing_offsets(sz, res);
-        let bx0 = bspline_val(sx, ox0); let bx1 = bspline_val(sx, ox1);
-        let by0 = bspline_val(sy, oy0); let by1 = bspline_val(sy, oy1);
-        let bz0 = bspline_val(sz, oz0); let bz1 = bspline_val(sz, oz1);
+        let bx0 = bspline1(sx - ox0 as f64); let bx1 = bspline1(sx - ox1 as f64);
+        let by0 = bspline1(sy - oy0 as f64); let by1 = bspline1(sy - oy1 as f64);
+        let bz0 = bspline1(sz - oz0 as f64); let bz1 = bspline1(sz - oz1 as f64);
 
         let mut v = 0.0;
         for &(ox, bx) in &[(ox0, bx0), (ox1, bx1)] { if bx == 0.0 { continue; }
@@ -494,6 +511,12 @@ impl FEMTree {
     }
 }
 
+/// N_1(t) — canonical degree-1 B-spline.
+fn bspline1(t: f64) -> f64 {
+    if t < 0.0 || t > 2.0 { 0.0 } else if t <= 1.0 { t } else { 2.0 - t }
+}
+
+/// Contributing B-spline offsets at position s on grid of size res.
 fn contributing_offsets(s: f64, res: usize) -> (u32, u32) {
     let f = s.floor() as isize;
     let r = res as isize;

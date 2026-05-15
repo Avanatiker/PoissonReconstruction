@@ -49,7 +49,7 @@ pub fn reconstruct(points: &[OrientedPoint], params: &ReconstructParams) -> (Mes
 
     let t0 = Instant::now();
     let base_depth = if params.depth > 2 { params.depth - 2 } else { 0 };
-    tree.solve_cascadic(&unit_pts, params.point_weight, base_depth, 5, params.cg_iters, params.cg_accuracy);
+    tree.solve_cascadic(&unit_pts, params.point_weight, base_depth, 20, params.cg_iters, params.cg_accuracy);
     s.time_solve = t0.elapsed().as_secs_f64();
 
     let t0 = Instant::now();
