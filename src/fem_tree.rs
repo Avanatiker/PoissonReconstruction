@@ -399,14 +399,22 @@ impl FEMTree {
                 let cx=(pt.position.x/h)as isize;let cy=(pt.position.y/h)as isize;let cz=(pt.position.z/h)as isize;
                 let tx=pt.position.x/h-cx as f64;let ty=pt.position.y/h-cy as f64;let tz=pt.position.z/h-cz as f64;
                 let bx0=1.-tx;let bx1=tx;let by0=1.-ty;let by1=ty;let bz0=1.-tz;let bz1=tz;
+                // Collect basis function values and indices for this point (up to 8 nodes)
+                let mut basis: Vec<(usize, f64)> = Vec::with_capacity(8);
                 for dz_i in 0..=1isize{for dy_i in 0..=1isize{for dx_i in 0..=1isize{
                     let ox=(cx+dx_i)as u32;let oy=(cy+dy_i)as u32;let oz=(cz+dz_i)as u32;
                     if ox>=res as u32||oy>=res as u32||oz>=res as u32{continue;}
                     if let Some(&idx)=self.offset_to_idx.get(&[ox,oy,oz]){
                         let bx=if dx_i==0{bx0}else{bx1};let by=if dy_i==0{by0}else{by1};let bz=if dz_i==0{bz0}else{bz1};
-                        re[idx].push((idx,wh3*(bx*by*bz).powi(2)));
+                        basis.push((idx, bx*by*bz));
                     }
                 }}}
+                // Add full sparse mass block: M[i,j] += w * phi_i * phi_j for all i,j in support
+                for &(i_idx, phi_i) in &basis {
+                    for &(j_idx, phi_j) in &basis {
+                        re[i_idx].push((j_idx, wh3 * phi_i * phi_j));
+                    }
+                }
             }
         }
         for row in &mut re { row.sort_by_key(|(j,_)|*j);let mut j=0;let mut u=0;
