@@ -80,32 +80,15 @@ impl FEMTree {
         if i == usize::MAX { None } else { Some(i) }
     }
 
-    pub fn initialize(&mut self, points: &[OrientedPoint], samples_per_node: f64) {
-        let res = 1usize << self.max_depth;
-        let h = 1.0 / res as f64;
-        let mut cell_counts: HashMap<[u32; DIM], f64> = HashMap::new();
-        for pt in points {
-            let mut o = [0u32; DIM]; let mut ok = true;
-            for d in 0..DIM { let c = (pt.position[d]/h) as isize; if c<0||c>=res as isize{ok=false;break;} o[d]=c as u32; }
-            if ok { *cell_counts.entry(o).or_insert(0.0) += 1.0; }
-        }
-        let maxd = self.max_depth as usize;
-        let mut dc: Vec<HashMap<[u32;DIM],f64>> = (0..=maxd).map(|_| HashMap::new()).collect();
-        dc[maxd] = cell_counts;
-        for d in (0..maxd).rev() {
-            let mut m = HashMap::new();
-            for (&[cx,cy,cz],&c) in &dc[d+1] { *m.entry([cx>>1,cy>>1,cz>>1]).or_insert(0.0) += c; }
-            dc[d] = m;
-        }
-        fn refine(node: &mut OctreeNode, d: u32, off: [u32; DIM], mx: u32, dc: &[HashMap<[u32;DIM],f64>], th: f64) {
+    pub fn initialize(&mut self, _points: &[OrientedPoint], _samples_per_node: f64) {
+        fn refine(node: &mut OctreeNode, d: u32, off: [u32; DIM], mx: u32) {
             if d>=mx {return;}
-            if dc[d as usize].get(&off).copied().unwrap_or(0.0) <= th {return;}
             node.init_children();
             if let Some(ref mut kids) = node.children { for i in 0..8u32 {
-                refine(&mut kids[i as usize],d+1,[off[0]*2+(i&1),off[1]*2+((i>>1)&1),off[2]*2+((i>>2)&1)],mx,dc,th);
+                refine(&mut kids[i as usize],d+1,[off[0]*2+(i&1),off[1]*2+((i>>1)&1),off[2]*2+((i>>2)&1)],mx);
             }}
         }
-        refine(&mut self.octree.root,0,[0;DIM],self.max_depth,&dc,samples_per_node);
+        refine(&mut self.octree.root,0,[0;DIM],self.max_depth);
         if self.max_depth > self.octree.max_depth { self.octree.max_depth = self.max_depth; }
     }
 
@@ -281,7 +264,7 @@ impl FEMTree {
                 if let Some(j) = self.idx_at(jx as usize, jy as usize, jz as usize) {
                     if j < self.normal_field.len() {
                         let v = self.normal_field[j];
-                        sum -= h * h * (v.x * deriv_mass_1d(dx) * mass_1d(dy) * mass_1d(dz)
+                        sum += h * h * (v.x * deriv_mass_1d(dx) * mass_1d(dy) * mass_1d(dz)
                              + v.y * mass_1d(dx) * deriv_mass_1d(dy) * mass_1d(dz)
                              + v.z * mass_1d(dx) * mass_1d(dy) * deriv_mass_1d(dz));
                     }
@@ -530,10 +513,70 @@ impl FEMTree {
     }
 
     /// Extract iso-surface by walking all octree leaves with standard MC triTable.
+    fn extract_with_values<F: Fn(f64, f64, f64) -> f64>(&self, iso: f64, eval: F) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+        let mut verts: Vec<[f64; 3]> = Vec::new();
+        let mut tris: Vec<[usize; 3]> = Vec::new();
+        let mut edge_hash: HashMap<(u64, u64, u64), usize> = HashMap::new();
+
+        let sorted = self.octree.sorted_nodes.as_ref().expect("not finalized");
+        let max_res = 1u64 << self.max_depth;
+
+        let co: [[u32; 3]; 8] = [[0,0,0],[1,0,0],[1,1,0],[0,1,0],[0,0,1],[1,0,1],[1,1,1],[0,1,1]];
+        let ev: [[usize; 2]; 12] = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+
+        for &node_ptr in &sorted.tree_nodes {
+            let node = unsafe { &*node_ptr };
+            if !node.is_leaf() { continue; }
+            let d = node.depth;
+            let off = node.offset;
+            let scale = max_res >> d as u64;
+            let w = scale as f64 / max_res as f64;
+
+            let mut cv = [0.0f64; 8]; let mut mc = 0usize;
+            for k in 0..8 {
+                let c = co[k];
+                let x = (off[0] as u64 + c[0] as u64) as f64 * w;
+                let y = (off[1] as u64 + c[1] as u64) as f64 * w;
+                let z = (off[2] as u64 + c[2] as u64) as f64 * w;
+                cv[k] = eval(x, y, z);
+                if cv[k] < iso { mc |= 1 << k; }
+            }
+
+            let em = EDGE_TABLE[mc] as u16;
+            if em == 0 { continue; }
+
+            let mut evi = [usize::MAX; 12];
+            for e in 0..12 {
+                if (em & (1 << e)) == 0 { continue; }
+                let arr = ev[e]; let a = arr[0]; let b = arr[1];
+                let dv = cv[b] - cv[a];
+                let t = if dv.abs() < 1e-15 { 0.5 } else { (iso - cv[a]) / dv };
+                let ca = co[a]; let cb = co[b];
+                let ax = (off[0] as u64 + ca[0] as u64) as f64 * w;
+                let ay = (off[1] as u64 + ca[1] as u64) as f64 * w;
+                let az = (off[2] as u64 + ca[2] as u64) as f64 * w;
+                let pos = [
+                    ax + t * (cb[0] as i32 - ca[0] as i32) as f64 * w,
+                    ay + t * (cb[1] as i32 - ca[1] as i32) as f64 * w,
+                    az + t * (cb[2] as i32 - ca[2] as i32) as f64 * w,
+                ];
+                let h = ((pos[0] * 1e9) as u64, (pos[1] * 1e9) as u64, (pos[2] * 1e9) as u64);
+                if let Some(ex) = edge_hash.get(&h) { evi[e] = *ex; }
+                else { let idx = verts.len(); edge_hash.insert(h, idx); verts.push(pos); evi[e] = idx; }
+            }
+
+            for i in (0..16).step_by(3) {
+                if TRI_TABLE[mc][i] < 0 { break; }
+                tris.push([evi[TRI_TABLE[mc][i] as usize], evi[TRI_TABLE[mc][i+1] as usize], evi[TRI_TABLE[mc][i+2] as usize]]);
+            }
+        }
+        (verts, tris)
+    }
+
     pub fn extract_surface(&self, iso: f64) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
         let mut verts: Vec<[f64; 3]> = Vec::new();
         let mut tris: Vec<[usize; 3]> = Vec::new();
-        let mut edge_hash: HashMap<u64, usize> = HashMap::new();
+        let mut edge_hash: HashMap<(u64, u64, u64), usize> = HashMap::new();
 
         let sorted = self.octree.sorted_nodes.as_ref().expect("not finalized");
         let max_res = 1u64 << self.max_depth;
@@ -579,7 +622,7 @@ impl FEMTree {
                     ay + t * (cb[1] as i32 - ca[1] as i32) as f64 * w,
                     az + t * (cb[2] as i32 - ca[2] as i32) as f64 * w,
                 ];
-                let h = (pos[0] * 1e7) as u64 ^ (pos[1] * 1e7) as u64 ^ (pos[2] * 1e7) as u64;
+                let h = ((pos[0] * 1e9) as u64, (pos[1] * 1e9) as u64, (pos[2] * 1e9) as u64);
                 if let Some(ex) = edge_hash.get(&h) { evi[e] = *ex; }
                 else { let idx = verts.len(); edge_hash.insert(h, idx); verts.push(pos); evi[e] = idx; }
             }
