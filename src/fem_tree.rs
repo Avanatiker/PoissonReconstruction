@@ -59,13 +59,16 @@ pub struct FEMTree {
     pub solution: Vec<f64>,
     pub normal_field: Vec<Vec3>,
     pub node_weight: Vec<f64>,
+    pub node_depths: Vec<u32>,
+    pub neighbors: Vec<Vec<(usize, isize, isize, isize, f64)>>,
 }
 
 impl FEMTree {
     pub fn new(max_depth: u32) -> Self {
         FEMTree { max_depth, fem_node_count: 0, octree: octree::Octree::new(),
             grid_to_idx: Vec::new(), idx_to_offset: Vec::new(),
-            solution: Vec::new(), normal_field: Vec::new(), node_weight: Vec::new() }
+            solution: Vec::new(), normal_field: Vec::new(), node_weight: Vec::new(),
+            node_depths: Vec::new(), neighbors: Vec::new() }
     }
 
     /// Fast O(1) lookup: offset → FEM index.
@@ -77,24 +80,41 @@ impl FEMTree {
         if i == usize::MAX { None } else { Some(i) }
     }
 
-    pub fn initialize(&mut self, _points: &[OrientedPoint], _threshold: f64) {
-        Self::refine_uniform(&mut self.octree.root, self.max_depth);
-        self.octree.max_depth = self.max_depth;
+    pub fn initialize(&mut self, points: &[OrientedPoint], samples_per_node: f64) {
+        let res = 1usize << self.max_depth;
+        let h = 1.0 / res as f64;
+        let mut cell_counts: HashMap<[u32; DIM], f64> = HashMap::new();
+        for pt in points {
+            let mut o = [0u32; DIM]; let mut ok = true;
+            for d in 0..DIM { let c = (pt.position[d]/h) as isize; if c<0||c>=res as isize{ok=false;break;} o[d]=c as u32; }
+            if ok { *cell_counts.entry(o).or_insert(0.0) += 1.0; }
+        }
+        let maxd = self.max_depth as usize;
+        let mut dc: Vec<HashMap<[u32;DIM],f64>> = (0..=maxd).map(|_| HashMap::new()).collect();
+        dc[maxd] = cell_counts;
+        for d in (0..maxd).rev() {
+            let mut m = HashMap::new();
+            for (&[cx,cy,cz],&c) in &dc[d+1] { *m.entry([cx>>1,cy>>1,cz>>1]).or_insert(0.0) += c; }
+            dc[d] = m;
+        }
+        fn refine(node: &mut OctreeNode, d: u32, off: [u32; DIM], mx: u32, dc: &[HashMap<[u32;DIM],f64>], th: f64) {
+            if d>=mx {return;}
+            if dc[d as usize].get(&off).copied().unwrap_or(0.0) <= th {return;}
+            node.init_children();
+            if let Some(ref mut kids) = node.children { for i in 0..8u32 {
+                refine(&mut kids[i as usize],d+1,[off[0]*2+(i&1),off[1]*2+((i>>1)&1),off[2]*2+((i>>2)&1)],mx,dc,th);
+            }}
+        }
+        refine(&mut self.octree.root,0,[0;DIM],self.max_depth,&dc,samples_per_node);
+        if self.max_depth > self.octree.max_depth { self.octree.max_depth = self.max_depth; }
     }
 
-    fn refine_uniform(node: &mut OctreeNode, target: u32) {
-        if node.depth < target {
-            node.init_children();
-            if let Some(ref mut kids) = node.children {
-                for c in kids.iter_mut() { Self::refine_uniform(c, target); }
-            }
-        }
-    }
 
     pub fn finalize(&mut self) {
         self.octree.finalize();
         let sorted = self.octree.sorted_nodes.as_ref().expect("not finalized");
         self.idx_to_offset.clear();
+        self.node_depths.clear();
         let res = 1usize << self.max_depth;
         self.grid_to_idx = vec![usize::MAX; res * res * res];
         let mut idx = 0;
@@ -102,16 +122,24 @@ impl FEMTree {
             unsafe {
                 let n = &mut *np;
                 if n.is_leaf() && n.depth == self.max_depth {
+                    let d = n.depth;
+                    let o = n.offset;
+                    let scale = 1u32 << (self.max_depth - d);
+                    let ox = o[0] * scale;
+                    let oy = o[1] * scale;
+                    let oz = o[2] * scale;
                     n.data_mut().set_flag(octree::flags::SPACE_FLAG, true);
                     n.data_mut().set_flag(octree::flags::FEM_FLAG_1, true);
                     n.data_mut().node_index = idx as octree::NodeIndex;
-                    let o = n.offset;
-                    self.grid_to_idx[o[2] as usize * res * res + o[1] as usize * res + o[0] as usize] = idx;
-                    self.idx_to_offset.push(o); idx += 1;
+                    self.grid_to_idx[oz as usize * res * res + oy as usize * res + ox as usize] = idx;
+                    self.idx_to_offset.push([ox, oy, oz]);
+                    self.node_depths.push(d);
+                    idx += 1;
                 }
             }
         }
         self.fem_node_count = idx; self.solution.resize(idx, 0.0);
+
     }
 
     /// Splat oriented normals using degree-1 B-spline (bilinear) weights.
@@ -394,6 +422,56 @@ impl FEMTree {
 
     /// Cascadic solver: CG at coarsest level, then GS relaxation up to finest.
     /// Matches C++ approach: cascadic=true, cgDepth=0, iters=8.
+    fn upsample_kernel(levels: usize) -> Vec<f64> {
+        let mut kernel = vec![0.5, 1.0, 0.5];
+        for _ in 1..levels {
+            let prev = kernel.clone();
+            let new_len = prev.len() + 2;
+            kernel = vec![0.0; new_len];
+            for i in 0..prev.len() {
+                let w = prev[i];
+                kernel[i] += w * 0.5;
+                kernel[i + 1] += w;
+                kernel[i + 2] += w * 0.5;
+            }
+        }
+        kernel
+    }
+
+    fn cross_depth_stiffness(di: u32, dj: u32, dx: isize, dy: isize, dz: isize) -> f64 {
+        if di == dj {
+            let h = 1.0 / (1usize << di) as f64;
+            return stiffness_entry(h, dx, dy, dz);
+        }
+        let (dc, df) = if di < dj { (di, dj) } else { (dj, di) };
+        let levels = (df - dc) as usize;
+        let kernel = Self::upsample_kernel(levels);
+        let ksize = kernel.len();
+        let half = (ksize - 1) / 2;
+        let h = 1.0 / (1usize << df) as f64;
+        let mut total = 0.0;
+        for kz_i in 0..ksize {
+            let kz_v = kernel[kz_i];
+            let dz_k = kz_i as isize - half as isize - dz;
+            let mz = mass_1d(dz_k);
+            let sz = stiff_1d(dz_k);
+            for ky_i in 0..ksize {
+                let ky_v = kernel[ky_i];
+                let dy_k = ky_i as isize - half as isize - dy;
+                let my = mass_1d(dy_k);
+                let sy = stiff_1d(dy_k);
+                for kx_i in 0..ksize {
+                    let kx_v = kernel[kx_i];
+                    let dx_k = kx_i as isize - half as isize - dx;
+                    let mx = mass_1d(dx_k);
+                    let sx = stiff_1d(dx_k);
+                    total += kx_v * ky_v * kz_v * (sx * my * mz + mx * sy * mz + mx * my * sz) * h;
+                }
+            }
+        }
+        total
+    }
+
     pub fn solve_cascadic(
         &mut self, points: &[OrientedPoint], pw: f64,
         base_depth: u32, gs: usize, cg: usize, eps: f64,
@@ -423,144 +501,6 @@ impl FEMTree {
         // GS relaxation at fine level, then CG to remove global oscillations
         for _ in 0..gs { solvers::gauss_seidel_sweep(&fine_sys, &fine_rhs, &mut self.solution); }
         solvers::solve_cg(&fine_sys, &fine_rhs, &mut self.solution, cg / 4, eps);
-    }
-
-    /// Build restriction matrix: fine (depth+1) → coarse (depth).
-    fn build_restriction(&self, coarse_depth: u32) -> SparseMatrix<f64> {
-        let fine_res = 1usize << (coarse_depth + 1);
-        let coarse_res = 1usize << coarse_depth;
-        let n_coarse = coarse_res * coarse_res * coarse_res;
-        let bw = [0.5, 1.0, 0.5];
-        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_coarse];
-        for cz in 0..coarse_res { for cy in 0..coarse_res { for cx in 0..coarse_res {
-            let ci = (cz * coarse_res + cy) * coarse_res + cx;
-            for dz in 0..=2isize { let fz = cz as isize * 2 + dz - 1;
-                if fz < 0 || fz >= fine_res as isize { continue; }
-                for dy in 0..=2isize { let fy = cy as isize * 2 + dy - 1;
-                    if fy < 0 || fy >= fine_res as isize { continue; }
-                    for dx in 0..=2isize { let fx = cx as isize * 2 + dx - 1;
-                        if fx < 0 || fx >= fine_res as isize { continue; }
-                        let fi = (fz as usize * fine_res + fy as usize) * fine_res + fx as usize;
-                        rows[ci].push((fi, bw[dx as usize] * bw[dy as usize] * bw[dz as usize]));
-                    }
-                }
-            }
-        }}}
-        for row in &mut rows { row.sort_by_key(|(j,_)|*j); }
-        let mut mat = SparseMatrix::with_capacity(n_coarse, rows.iter().map(|r|r.len()).sum());
-        for i in 0..n_coarse { mat.set_row_size(i, rows[i].len()); } mat.finalize_structure();
-        for i in 0..n_coarse { let r = mat.row_mut(i); for (k,&(c,v)) in rows[i].iter().enumerate(){r[k]=MatrixEntry::new(c,v);} }
-        mat
-    }
-
-    /// Build prolongation matrix: coarse (depth) → fine (depth+1).
-    /// Degree-1 B-spline up-sampling weights [1/2, 1, 1/2] per dim.
-    fn build_prolongation(&self, coarse_depth: u32) -> SparseMatrix<f64> {
-        let fine_res = 1usize << (coarse_depth + 1);
-        let coarse_res = 1usize << coarse_depth;
-        let n_fine = fine_res * fine_res * fine_res;
-        let bw = [0.5, 1.0, 0.5];
-        let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_fine];
-        for cz in 0..coarse_res { for cy in 0..coarse_res { for cx in 0..coarse_res {
-            let ci = (cz * coarse_res + cy) * coarse_res + cx;
-            for dz in 0..=2isize { let fz = cz as isize * 2 + dz - 1;
-                if fz < 0 || fz >= fine_res as isize { continue; }
-                for dy in 0..=2isize { let fy = cy as isize * 2 + dy - 1;
-                    if fy < 0 || fy >= fine_res as isize { continue; }
-                    for dx in 0..=2isize { let fx = cx as isize * 2 + dx - 1;
-                        if fx < 0 || fx >= fine_res as isize { continue; }
-                        let fi = (fz as usize * fine_res + fy as usize) * fine_res + fx as usize;
-                        rows[fi].push((ci, bw[dx as usize] * bw[dy as usize] * bw[dz as usize]));
-                    }
-                }
-            }
-        }}}
-        for row in &mut rows { row.sort_by_key(|(j,_)|*j); row.dedup_by(|a,b| a.0==b.0); }
-        let mut mat = SparseMatrix::with_capacity(n_fine, rows.iter().map(|r|r.len()).sum());
-        for i in 0..n_fine { mat.set_row_size(i, rows[i].len()); } mat.finalize_structure();
-        for i in 0..n_fine { let r = mat.row_mut(i); for (k,&(c,v)) in rows[i].iter().enumerate(){r[k]=MatrixEntry::new(c,v);} }
-        mat
-    }
-
-    /// Sparse * sparse multiply: C = A * B.
-    fn sparse_mul(a: &SparseMatrix<f64>, b: &SparseMatrix<f64>) -> SparseMatrix<f64> {
-        let n = a.num_rows();
-        let mut rows: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
-        for i in 0..n {
-            for ea in a.row(i) {
-                for eb in b.row(ea.col) {
-                    *rows[i].entry(eb.col).or_insert(0.0) += ea.value * eb.value;
-                }
-            }
-        }
-        let mut entries: Vec<Vec<(usize, f64)>> = rows.iter().map(|r| r.iter().map(|(&k,&v)| (k,v)).collect()).collect();
-        for row in &mut entries { row.sort_by_key(|(j,_)|*j); }
-        let nnz = entries.iter().map(|r|r.len()).sum();
-        let mut mat = SparseMatrix::with_capacity(n, nnz);
-        for i in 0..n { mat.set_row_size(i, entries[i].len()); } mat.finalize_structure();
-        for i in 0..n { let r = mat.row_mut(i); for (k,&(c,v)) in entries[i].iter().enumerate(){r[k]=MatrixEntry::new(c,v);} }
-        mat
-    }
-
-    /// Galerkin-coarsened V-cycle: `M_coarse = R * M_fine * P` preserves system properties.
-    /// Cascadic flow: restrict RHS → solve base → prolongate up with GS.
-    pub fn solve_multigrid(
-        &mut self, points: &[OrientedPoint], pw: f64,
-        base_depth: u32, gs: usize, base_cg: usize, eps: f64,
-    ) {
-        let max_d = self.max_depth;
-        if base_depth >= max_d {
-            let fine_sys = self.assemble_system(points, pw);
-            let fine_rhs = self.assemble_rhs(points, pw);
-            self.solution.resize(self.fem_node_count, 0.0); self.solution.fill(0.0);
-            for _ in 0..gs { solvers::gauss_seidel_sweep(&fine_sys, &fine_rhs, &mut self.solution); }
-            solvers::solve_cg(&fine_sys, &fine_rhs, &mut self.solution, base_cg, eps);
-            return;
-        }
-
-        // Level 0 = finest
-        let mut mats: Vec<SparseMatrix<f64>> = Vec::new();
-        let mut rhss: Vec<Vec<f64>> = Vec::new();
-        let mut xs: Vec<Vec<f64>> = Vec::new();
-        mats.push(self.assemble_system(points, pw));
-        rhss.push(self.assemble_rhs(points, pw));
-        xs.push(vec![0.0; mats[0].num_rows()]);
-
-        // Build R+P and Galerkin-coarsen down the hierarchy
-        let mut restricts: Vec<SparseMatrix<f64>> = Vec::new();
-        for l in 0..(max_d - base_depth) as usize {
-            let cd = max_d - 1 - l as u32;
-            let r = self.build_restriction(cd);
-            let p = self.build_prolongation(cd);
-            let temp = Self::sparse_mul(&r, &mats[l]);
-            let mc = Self::sparse_mul(&temp, &p);
-            // Restrict RHS
-            let n_c = mc.num_rows();
-            let mut crhs = vec![0.0; n_c];
-            r.multiply_vector(&rhss[l], &mut crhs);
-            mats.push(mc);
-            rhss.push(crhs);
-            xs.push(vec![0.0; n_c]);
-            restricts.push(r);
-        }
-
-        // Cascadic: solve at base, prolongate up with GS
-        let bl = restricts.len();
-        xs[bl].fill(0.0);
-        for _ in 0..gs { solvers::gauss_seidel_sweep(&mats[bl], &rhss[bl], &mut xs[bl]); }
-        solvers::solve_cg(&mats[bl], &rhss[bl], &mut xs[bl], base_cg, eps);
-
-        for l in (0..restricts.len()).rev() {
-            let n_f = xs[l].len();
-            for ci in 0..xs[l+1].len() {
-                let v = xs[l+1][ci]; if v == 0.0 { continue; }
-                for e in restricts[l].row(ci) { if e.col < n_f { xs[l][e.col] += v * e.value; } }
-            }
-            for _ in 0..gs { solvers::gauss_seidel_sweep(&mats[l], &rhss[l], &mut xs[l]); }
-        }
-
-        self.solution.resize(self.fem_node_count, 0.0);
-        for i in 0..self.fem_node_count.min(xs[0].len()) { self.solution[i] = xs[0][i]; }
     }
 
     /// Evaluate FEM implicit function at any point in the unit cube.
